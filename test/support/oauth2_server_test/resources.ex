@@ -275,6 +275,31 @@ defmodule Oauth2ServerTest.Server do
     dcr_enabled?: true
 end
 
+defmodule Oauth2ServerTest.NarrowingServer do
+  @moduledoc """
+  `Oauth2ServerTest.MultiResourceServer` with `resource_scope_policy: :narrow`:
+  an omitted scope defaults to the resource's scopes and scopes of the
+  other resource are dropped rather than rejected.
+  """
+
+  use AshAuthentication.Oauth2Server,
+    otp_app: :ash_authentication_oauth2_server,
+    user_resource: Oauth2ServerTest.User,
+    issuer_url: {Oauth2ServerTest.Secrets, []},
+    resources: [
+      mcp: [url: {Oauth2ServerTest.Secrets, []}, scopes: ["mcp", "mcp:write"]],
+      gql: [url: {Oauth2ServerTest.Secrets, []}, scopes: ["gql"]]
+    ],
+    signing_secret: {Oauth2ServerTest.Secrets, []},
+    client_resource: Oauth2ServerTest.OAuthClient,
+    authorization_code_resource: Oauth2ServerTest.OAuthAuthorizationCode,
+    refresh_token_resource: Oauth2ServerTest.OAuthRefreshToken,
+    consent_resource: Oauth2ServerTest.OAuthConsent,
+    scopes: ["mcp", "mcp:write", "gql"],
+    dcr_enabled?: true,
+    resource_scope_policy: :narrow
+end
+
 defmodule Oauth2ServerTest.MultiResourceServer do
   @moduledoc """
   Protects two resources on one host, `/mcp` and `/gql`, each with its own

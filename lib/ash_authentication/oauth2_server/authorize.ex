@@ -95,9 +95,10 @@ defmodule AshAuthentication.Oauth2Server.Authorize do
          :ok <- check_string_params(params, ["resource", "scope", "state"]),
          :ok <- require_eq(params, "code_challenge_method", "S256", "invalid_request"),
          :ok <- require_eq(params, "response_type", "code", "unsupported_response_type"),
-         {:ok, scope} <- require_scope(params),
-         :ok <- check_scopes(server, scope),
-         {:ok, resource} <- resolve_resource(server, params, scope, secret_context) do
+         {:ok, requested} <- requested_scopes(server, params),
+         :ok <- check_scopes(server, requested),
+         {:ok, name} <- resolve_resource(server, params, requested, secret_context),
+         {:ok, scope} <- resolve_scope(server, name, requested) do
       {:ok,
        %{
          client: client,
@@ -105,7 +106,7 @@ defmodule AshAuthentication.Oauth2Server.Authorize do
          code_challenge: code_challenge,
          scope: scope,
          state: optional(params, "state"),
-         resource: resource
+         resource: server.resource_url(name, secret_context)
        }}
     end
   end
@@ -287,12 +288,20 @@ defmodule AshAuthentication.Oauth2Server.Authorize do
     end
   end
 
-  # OAuth 2.1 §1.4.1: without a default scope, a request that omits
-  # `scope` fails as `invalid_scope`.
-  defp require_scope(params) do
+  # The requested scopes as a list, in request order. `nil` means the
+  # request omitted `scope` and the `:narrow` resource scope policy will
+  # default it to the selected resource's scopes (OAuth 2.1 §1.4.1 lets the
+  # server apply a default). Under `:strict` an omitted `scope` fails as
+  # `invalid_scope`.
+  defp requested_scopes(server, params) do
     case require_present(params, "scope") do
-      {:ok, scope} -> {:ok, scope}
-      {:error, _code, _desc} -> {:error, "invalid_scope", "scope is required"}
+      {:ok, scope} ->
+        {:ok, String.split(scope, " ", trim: true)}
+
+      {:error, _code, _desc} ->
+        if server.resource_scope_policy() == :narrow,
+          do: {:ok, nil},
+          else: {:error, "invalid_scope", "scope is required"}
     end
   end
 
@@ -394,12 +403,11 @@ defmodule AshAuthentication.Oauth2Server.Authorize do
   # must be in the server's advertised catalogue. When false, scopes are
   # passed through unchecked — for apps with a dynamic catalogue that
   # validate scopes downstream.
-  defp check_scopes(server, scope) when is_binary(scope) do
-    if server.enforce_scopes?() do
-      allowed = MapSet.new(server.scopes())
-      requested = scope |> String.split(" ", trim: true) |> MapSet.new()
+  defp check_scopes(_server, nil), do: :ok
 
-      case MapSet.difference(requested, allowed) |> MapSet.to_list() do
+  defp check_scopes(server, requested) when is_list(requested) do
+    if server.enforce_scopes?() do
+      case requested -- server.scopes() do
         [] -> :ok
         [unknown | _] -> {:error, "invalid_scope", scope_error_description(unknown)}
       end
@@ -422,14 +430,12 @@ defmodule AshAuthentication.Oauth2Server.Authorize do
   # resource (RFC 9068 §3). Error descriptions echo the configured
   # identifiers (server-controlled), never the user-supplied value, so they
   # don't create a "reflect user input" surface.
-  defp resolve_resource(server, params, scope, secret_context) do
-    requested = scope |> String.split(" ", trim: true) |> MapSet.new()
+  #
+  # Returns the resource's configured name; the caller turns it into the
+  # identifier URL.
+  defp resolve_resource(server, params, requested, secret_context) do
     check_disjoint_scopes!(server)
-
-    with {:ok, name} <- select_resource(server, params, requested, secret_context),
-         :ok <- check_resource_scopes(server, name, requested) do
-      {:ok, server.resource_url(name, secret_context)}
-    end
+    select_resource(server, params, requested, secret_context)
   end
 
   defp select_resource(server, %{"resource" => res}, _requested, secret_context)
@@ -448,6 +454,16 @@ defmodule AshAuthentication.Oauth2Server.Authorize do
     end
   end
 
+  # No `resource` and no `scope`: only a single configured resource can be
+  # selected. With several, the request is as ambiguous as under the strict
+  # policy and fails the same way.
+  defp select_resource(server, _params, nil, _secret_context) do
+    case server.resources() do
+      [name] -> {:ok, name}
+      _names -> {:error, "invalid_scope", "scope is required"}
+    end
+  end
+
   defp select_resource(server, _params, requested, _secret_context) do
     case server.resources() do
       [name] ->
@@ -455,7 +471,9 @@ defmodule AshAuthentication.Oauth2Server.Authorize do
 
       names ->
         names
-        |> Enum.filter(&MapSet.subset?(requested, MapSet.new(server.resource_scopes(&1))))
+        |> Enum.filter(
+          &MapSet.subset?(MapSet.new(requested), MapSet.new(server.resource_scopes(&1)))
+        )
         |> case do
           [name] ->
             {:ok, name}
@@ -483,23 +501,41 @@ defmodule AshAuthentication.Oauth2Server.Authorize do
     end
   end
 
-  # RFC 8707 §2 — `invalid_target` also reports a scope that the selected
-  # resource does not accept.
-  defp check_resource_scopes(server, name, requested) do
+  # The scope the grant will carry, as a string in request order.
+  #
+  # An omitted `scope` (only possible under the `:narrow` policy) becomes
+  # the selected resource's full scope list. A requested scope that the
+  # selected resource does not accept is an `invalid_target` error under
+  # `:strict` (RFC 8707 §2). Under `:narrow` it is dropped and the grant is
+  # issued for the remainder, which OAuth 2.1 §3.3 permits — the token
+  # response reports the narrower `scope`. Nothing left is still an error.
+  defp resolve_scope(server, name, nil),
+    do: {:ok, Enum.join(server.resource_scopes(name), " ")}
+
+  defp resolve_scope(server, name, requested) do
     if server.enforce_scopes?() do
-      allowed = MapSet.new(server.resource_scopes(name))
+      allowed = server.resource_scopes(name)
 
-      case requested |> MapSet.difference(allowed) |> MapSet.to_list() do
-        [] ->
-          :ok
+      case {requested -- allowed, server.resource_scope_policy()} do
+        {[], _policy} ->
+          {:ok, Enum.join(requested, " ")}
 
-        [unknown | _] ->
-          {:error, "invalid_target", scope_error_description(unknown) <> " for this resource"}
+        {outside, :narrow} ->
+          case requested -- outside do
+            [] -> {:error, "invalid_target", resource_scope_error(outside)}
+            kept -> {:ok, Enum.join(kept, " ")}
+          end
+
+        {outside, :strict} ->
+          {:error, "invalid_target", resource_scope_error(outside)}
       end
     else
-      :ok
+      {:ok, Enum.join(requested, " ")}
     end
   end
+
+  defp resource_scope_error([unknown | _]),
+    do: scope_error_description(unknown) <> " for this resource"
 
   defp secret_context(nil), do: %{}
   defp secret_context(tenant), do: %{tenant: tenant}

@@ -38,6 +38,7 @@ defmodule AshAuthentication.Oauth2Server do
   |---|---|---|
   | `:scopes` | `[]` | Scope catalogue advertised in metadata and accepted at `/authorize`. Can be a static list (`["read", "write"]`), a 0-arity function (`fn -> [...] end`), or an MFA tuple (`{Module, :function, [args]}`) — use the function/MFA forms for dynamically-computed catalogues. The library default is empty, which combined with `:enforce_scopes?` (also default) means *no scope works out of the box* — the installer scaffolds a placeholder you're meant to replace. |
   | `:enforce_scopes?` | `true` | When `true`, requested scopes at `/authorize` MUST be a subset of `:scopes`. Set to `false` only if you have a dynamic / runtime-generated scope catalogue and intend to validate downstream. |
+  | `:resource_scope_policy` | `:strict` | How `/authorize` treats scopes against the resource the request targets. `:strict`: `scope` is required and a scope the resource does not accept is an `invalid_target` error. `:narrow`: an omitted `scope` defaults to the resource's full scope list, and scopes that belong to another resource are dropped from the grant (OAuth 2.1 §3.3; the token response carries the narrower `scope`). Use `:narrow` for MCP connectors — several clients copy every scope from `scopes_supported`, or send none at all. Scopes outside the catalogue are still rejected under either policy. |
   | `:access_token_lifetime` | `{1, :hour}` | `{integer, unit}` where unit is `:second`, `:minute`, `:hour`, or `:day` |
   | `:refresh_token_lifetime` | `{30, :days}` | |
   | `:authorization_code_lifetime` | `{10, :minutes}` | |
@@ -209,6 +210,7 @@ defmodule AshAuthentication.Oauth2Server do
     [
       scopes: [],
       enforce_scopes?: true,
+      resource_scope_policy: :strict,
       access_token_lifetime: {1, :hour},
       refresh_token_lifetime: {30, :days},
       authorization_code_lifetime: {10, :minutes},
@@ -254,6 +256,10 @@ defmodule AshAuthentication.Oauth2Server do
       end
 
       def enforce_scopes?, do: Keyword.fetch!(@oauth2_server_opts, :enforce_scopes?)
+
+      def resource_scope_policy,
+        do: Keyword.fetch!(@oauth2_server_opts, :resource_scope_policy)
+
       def clock_skew_seconds, do: Keyword.fetch!(@oauth2_server_opts, :clock_skew_seconds)
       def sign_in_path, do: Keyword.fetch!(@oauth2_server_opts, :sign_in_path)
 
@@ -369,6 +375,16 @@ defmodule AshAuthentication.Oauth2Server do
       other ->
         raise CompileError,
           description: "expected `:otp_app` to be an atom, got: #{inspect(other)}"
+    end
+
+    case Keyword.get(opts, :resource_scope_policy, :strict) do
+      policy when policy in [:strict, :narrow] ->
+        :ok
+
+      other ->
+        raise CompileError,
+          description:
+            "expected `:resource_scope_policy` to be `:strict` or `:narrow`, got: #{inspect(other)}"
     end
 
     Enum.each(

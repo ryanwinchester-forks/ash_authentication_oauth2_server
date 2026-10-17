@@ -243,6 +243,87 @@ defmodule AshAuthentication.Oauth2Server.MultiResourceTest do
     end
   end
 
+  describe "resource_scope_policy: :narrow" do
+    alias Oauth2ServerTest.NarrowingServer
+
+    test "an omitted scope defaults to the resource's scopes", %{client: client} do
+      {_verifier, challenge} = pkce_pair()
+      params = authorize_params(client, challenge, %{}) |> Map.delete("scope")
+
+      assert {:ok, %{scope: "mcp mcp:write", resource: @mcp}} =
+               Authorize.validate_request(NarrowingServer, params)
+    end
+
+    test "scopes of another resource are dropped, in request order", %{client: client} do
+      {_verifier, challenge} = pkce_pair()
+      params = authorize_params(client, challenge, %{"scope" => "gql mcp:write mcp"})
+
+      assert {:ok, %{scope: "mcp:write mcp", resource: @mcp}} =
+               Authorize.validate_request(NarrowingServer, params)
+    end
+
+    test "a request with nothing left for the resource is still invalid_target",
+         %{client: client} do
+      {_verifier, challenge} = pkce_pair()
+      params = authorize_params(client, challenge, %{"scope" => "gql"})
+
+      assert {:error, "invalid_target", desc} =
+               Authorize.validate_request(NarrowingServer, params)
+
+      assert desc =~ "gql"
+    end
+
+    test "a scope outside the catalogue is still invalid_scope", %{client: client} do
+      {_verifier, challenge} = pkce_pair()
+      params = authorize_params(client, challenge, %{"scope" => "mcp nope"})
+
+      assert {:error, "invalid_scope", _desc} =
+               Authorize.validate_request(NarrowingServer, params)
+    end
+
+    test "an omitted scope with no resource is still ambiguous", %{client: client} do
+      {_verifier, challenge} = pkce_pair()
+
+      params =
+        authorize_params(client, challenge, %{}) |> Map.drop(["scope", "resource"])
+
+      assert {:error, "invalid_scope", "scope is required"} =
+               Authorize.validate_request(NarrowingServer, params)
+    end
+
+    test "the token carries the narrowed scope", %{user: user, client: client} do
+      {verifier, challenge} = pkce_pair()
+      params = authorize_params(client, challenge, %{"scope" => "mcp gql"})
+      {:ok, validated} = Authorize.validate_request(NarrowingServer, params)
+      code = Authorize.issue_code!(NarrowingServer, user, validated)
+
+      assert {:ok, tokens} =
+               Token.exchange_authorization_code(NarrowingServer, %{
+                 "grant_type" => "authorization_code",
+                 "code" => code.id,
+                 "redirect_uri" => @redirect_uri,
+                 "code_verifier" => verifier,
+                 "client_id" => client.id,
+                 "resource" => @mcp
+               })
+
+      assert tokens.scope == "mcp"
+      assert {:ok, claims} = Jwt.verify(NarrowingServer, tokens.access_token, resource: :mcp)
+      assert claims["scope"] == "mcp"
+      assert claims["aud"] == @mcp
+    end
+
+    test "rejects an unknown policy" do
+      assert_raise CompileError, ~r/resource_scope_policy/, fn ->
+        Oauth2Server.__validate_opts__!(
+          M,
+          @base ++
+            [resources: [mcp: [url: @mcp, scopes: ["mcp"]]], resource_scope_policy: :lenient]
+        )
+      end
+    end
+  end
+
   describe "token" do
     test "the access token is valid only at the resource of the grant",
          %{user: user, client: client} do
