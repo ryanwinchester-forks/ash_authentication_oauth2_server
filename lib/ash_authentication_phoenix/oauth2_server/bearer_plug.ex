@@ -113,7 +113,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.BearerPlug do
   @behaviour Plug
   import Plug.Conn
 
-  alias AshAuthentication.Oauth2Server.Jwt
+  alias AshAuthentication.Oauth2Server.{Jwt, StoreError}
   alias AshAuthentication.Phoenix.Oauth2Server.Errors
 
   @impl Plug
@@ -227,15 +227,9 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.BearerPlug do
   # A missing or forbidden record is the token's problem; anything else
   # (`Ash.Error.Invalid.Unavailable` from a data layer, an unknown error)
   # is the store's.
-  defp classify_load_error(%Ash.Error.Forbidden{}), do: :user_not_found
-
-  defp classify_load_error(%{errors: errors}) when is_list(errors) and errors != [] do
-    if Enum.all?(errors, &match?(%Ash.Error.Query.NotFound{}, &1)),
-      do: :user_not_found,
-      else: :unavailable
+  defp classify_load_error(error) do
+    if StoreError.refusal?(error), do: :user_not_found, else: :unavailable
   end
-
-  defp classify_load_error(_), do: :unavailable
 
   defp unavailable(conn) do
     conn

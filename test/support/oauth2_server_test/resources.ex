@@ -40,11 +40,12 @@ defmodule Oauth2ServerTest.Outage do
 
   @key :oauth2_server_test_outage
 
+  @doc "`true` fails every read, a list of resources only theirs, `false` none."
   def simulate(on?), do: Process.put(@key, on?)
 
   @impl true
   def prepare(query, _opts, _context) do
-    if Process.get(@key, false) do
+    if outage?(Process.get(@key, false), query.resource) do
       Ash.Query.add_error(
         query,
         Ash.Error.Invalid.Unavailable.exception(
@@ -56,6 +57,10 @@ defmodule Oauth2ServerTest.Outage do
       query
     end
   end
+
+  defp outage?(true, _resource), do: true
+  defp outage?(resources, resource) when is_list(resources), do: resource in resources
+  defp outage?(_, _resource), do: false
 end
 
 defmodule Oauth2ServerTest.OAuthClient do
@@ -80,7 +85,12 @@ defmodule Oauth2ServerTest.OAuthClient do
   end
 
   actions do
-    defaults [:read, :destroy]
+    defaults [:destroy]
+
+    read :read do
+      primary? true
+      prepare Oauth2ServerTest.Outage
+    end
 
     create :register do
       accept [

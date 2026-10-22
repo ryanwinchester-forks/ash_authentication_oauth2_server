@@ -70,6 +70,7 @@ defmodule AshAuthentication.Oauth2Server.CIMD do
   alias AshAuthentication.Oauth2Server.CIMD.Cache
   alias AshAuthentication.Oauth2Server.ClientMetadata
   alias AshAuthentication.Oauth2Server.ClientResource
+  alias AshAuthentication.Oauth2Server.StoreError
 
   @ash_context %{private: %{ash_authentication?: true}}
 
@@ -119,9 +120,12 @@ defmodule AshAuthentication.Oauth2Server.CIMD do
   Look up an already-resolved CIMD client by its URL — database only, no
   fetch. Used by the token, revocation, and error-redirect paths, where
   the client must have been resolved during authorization already.
+
+  `:error` means no such client; `{:error, :server_error}` means the store
+  did not answer, which callers must not report as an unknown client.
   """
   @spec find_client(server :: module(), url :: String.t(), opts :: keyword()) ::
-          {:ok, Ash.Resource.Record.t()} | :error
+          {:ok, Ash.Resource.Record.t()} | :error | {:error, :server_error}
   def find_client(server, url, opts \\ []) do
     server.client_resource()
     |> Ash.Query.filter(cimd_url == ^url)
@@ -131,8 +135,17 @@ defmodule AshAuthentication.Oauth2Server.CIMD do
         maybe_touch_last_used(client, opts)
         {:ok, client}
 
-      _ ->
+      {:ok, nil} ->
         :error
+
+      # The store did not answer; the client may well be registered.
+      {:error, error} ->
+        if StoreError.refusal?(error) do
+          :error
+        else
+          Logger.error("Oauth2Server: CIMD client lookup failed: " <> inspect(error))
+          {:error, :server_error}
+        end
     end
   end
 

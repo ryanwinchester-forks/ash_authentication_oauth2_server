@@ -28,7 +28,7 @@ defmodule AshAuthentication.Oauth2Server.Token do
   require Ash.Query
   require Logger
 
-  alias AshAuthentication.Oauth2Server.{CIMD, Jwt, PKCE}
+  alias AshAuthentication.Oauth2Server.{CIMD, Jwt, PKCE, StoreError}
 
   @ash_context %{private: %{ash_authentication?: true}}
 
@@ -149,12 +149,16 @@ defmodule AshAuthentication.Oauth2Server.Token do
   # ones (Client ID Metadata Documents) resolve to the client row that was
   # upserted at authorize time — a database lookup only, never a fetch.
   # An unknown client is `invalid_client` (OAuth 2.1 §3.2.4), checked
-  # before the grant. Returns `{:ok, presented, client}`.
+  # before the grant. A store that did not answer is `:server_error`: clients
+  # take `invalid_client` as a dead registration and drop their tokens, and
+  # a first-party app would sign the person out over a database hiccup.
+  # Returns `{:ok, presented, client}`.
   defp resolve_client_id(server, %{"client_id" => "https://" <> _ = url}, opts) do
     with true <- server.cimd_enabled?(),
          {:ok, client} <- CIMD.find_client(server, url, opts) do
       {:ok, url, client}
     else
+      {:error, :server_error} -> {:error, :server_error}
       _ -> {:error, :invalid_client}
     end
   end
@@ -163,11 +167,20 @@ defmodule AshAuthentication.Oauth2Server.Token do
        when is_binary(client_id) and client_id != "" do
     case Ash.get(server.client_resource(), client_id, ash_opts(opts)) do
       {:ok, client} -> {:ok, client_id, client}
-      _ -> {:error, :invalid_client}
+      {:error, error} -> {:error, client_lookup_error(error)}
     end
   end
 
   defp resolve_client_id(_server, _params, _opts), do: {:error, :invalid_request}
+
+  defp client_lookup_error(error) do
+    if StoreError.refusal?(error) do
+      :invalid_client
+    else
+      Logger.error("Oauth2Server: client lookup failed: " <> inspect(error))
+      :server_error
+    end
+  end
 
   # OAuth 2.1 §3.2.4: a client may use only the grant types it registered.
   # A client without registered grant types has the RFC 7591 §2 default,

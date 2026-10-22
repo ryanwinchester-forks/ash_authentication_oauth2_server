@@ -840,7 +840,7 @@ defmodule AshAuthentication.Oauth2Server.FlowTest do
 
       # Neither `invalid_grant` (the client would drop the token) nor
       # `reuse` (the chain would be revoked): the store simply did not answer.
-      Oauth2ServerTest.Outage.simulate(true)
+      Oauth2ServerTest.Outage.simulate([Oauth2ServerTest.OAuthRefreshToken])
       assert {:error, :server_error} = Token.exchange_refresh_token(Server, params)
 
       assert {:error, :server_error} =
@@ -849,6 +849,60 @@ defmodule AshAuthentication.Oauth2Server.FlowTest do
       Oauth2ServerTest.Outage.simulate(false)
 
       assert {:ok, _second} = Token.exchange_refresh_token(Server, params)
+    end
+
+    test "a client lookup during a store outage is a server error, not an unknown client",
+         %{user: user} do
+      {client, _} = register_client()
+      {verifier, challenge} = pkce_pair()
+
+      {:ok, validated} =
+        Authorize.validate_request(
+          Server,
+          authorize_params(client, challenge, "https://chat.example.com/cb")
+        )
+
+      code = Authorize.issue_code!(Server, user, validated)
+
+      {:ok, first} =
+        Token.exchange_authorization_code(Server, %{
+          "grant_type" => "authorization_code",
+          "code" => code.id,
+          "redirect_uri" => "https://chat.example.com/cb",
+          "code_verifier" => verifier,
+          "client_id" => client.id,
+          "resource" => Server.resource_url()
+        })
+
+      params = %{
+        "grant_type" => "refresh_token",
+        "refresh_token" => first.refresh_token,
+        "client_id" => client.id,
+        "resource" => Server.resource_url()
+      }
+
+      # `invalid_client` tells a client its registration is gone, and a
+      # first-party app signs the person out on it. The client is still
+      # registered; only the store failed.
+      Oauth2ServerTest.Outage.simulate([Oauth2ServerTest.OAuthClient])
+      on_exit(fn -> Oauth2ServerTest.Outage.simulate(false) end)
+      assert {:error, :server_error} = Token.exchange_refresh_token(Server, params)
+
+      assert {:error, :server_error} =
+               Token.revoke(Server, Map.put(params, "token", first.refresh_token))
+
+      Oauth2ServerTest.Outage.simulate(false)
+      assert {:ok, _second} = Token.exchange_refresh_token(Server, params)
+
+      # A store that answered still refuses: unknown and malformed ids alike.
+      assert {:error, :invalid_client} =
+               Token.exchange_refresh_token(
+                 Server,
+                 Map.put(params, "client_id", Ash.UUIDv7.generate())
+               )
+
+      assert {:error, :invalid_client} =
+               Token.exchange_refresh_token(Server, Map.put(params, "client_id", "not-a-client"))
     end
 
     test "chain revocation revokes every rotation descendant in one shot",

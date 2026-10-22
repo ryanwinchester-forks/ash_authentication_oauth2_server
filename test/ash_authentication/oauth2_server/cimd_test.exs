@@ -265,6 +265,18 @@ defmodule AshAuthentication.Oauth2Server.CIMDTest do
       assert :error = CIMD.find_client(CimdServer, "https://never.seen/client")
       assert Ash.count!(OAuthClient) == 0
     end
+
+    test "reports a store outage as a server error, not an unknown client" do
+      StubFetcher.stub(@client_id, document())
+      {:ok, _client} = CIMD.resolve_client(CimdServer, @client_id)
+
+      Oauth2ServerTest.Outage.simulate([OAuthClient])
+      on_exit(fn -> Oauth2ServerTest.Outage.simulate(false) end)
+      assert {:error, :server_error} = CIMD.find_client(CimdServer, @client_id)
+
+      Oauth2ServerTest.Outage.simulate(false)
+      assert {:ok, _found} = CIMD.find_client(CimdServer, @client_id)
+    end
   end
 
   describe "authorize with a URL client_id" do
