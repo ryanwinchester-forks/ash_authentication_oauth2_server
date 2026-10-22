@@ -808,6 +808,49 @@ defmodule AshAuthentication.Oauth2Server.FlowTest do
                Token.exchange_refresh_token(Server, refresh_params.(second.refresh_token))
     end
 
+    test "a refresh during a store outage is a server error and leaves the token usable",
+         %{user: user} do
+      {client, _} = register_client()
+      {verifier, challenge} = pkce_pair()
+
+      {:ok, validated} =
+        Authorize.validate_request(
+          Server,
+          authorize_params(client, challenge, "https://chat.example.com/cb")
+        )
+
+      code = Authorize.issue_code!(Server, user, validated)
+
+      {:ok, first} =
+        Token.exchange_authorization_code(Server, %{
+          "grant_type" => "authorization_code",
+          "code" => code.id,
+          "redirect_uri" => "https://chat.example.com/cb",
+          "code_verifier" => verifier,
+          "client_id" => client.id,
+          "resource" => Server.resource_url()
+        })
+
+      params = %{
+        "grant_type" => "refresh_token",
+        "refresh_token" => first.refresh_token,
+        "client_id" => client.id,
+        "resource" => Server.resource_url()
+      }
+
+      # Neither `invalid_grant` (the client would drop the token) nor
+      # `reuse` (the chain would be revoked): the store simply did not answer.
+      Oauth2ServerTest.Outage.simulate(true)
+      assert {:error, :server_error} = Token.exchange_refresh_token(Server, params)
+
+      assert {:error, :server_error} =
+               Token.exchange_refresh_token(Server, Map.put(params, "scope", "mcp"))
+
+      Oauth2ServerTest.Outage.simulate(false)
+
+      assert {:ok, _second} = Token.exchange_refresh_token(Server, params)
+    end
+
     test "chain revocation revokes every rotation descendant in one shot",
          %{user: user} do
       {client, _} = register_client()

@@ -156,6 +156,14 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.BearerPlug do
             |> Ash.PlugHelpers.set_actor(user)
             |> assign(:oauth_claims, claims)
 
+          # The token verified but the user store did not answer (the
+          # database is down or its pool is exhausted). That is not an
+          # invalid token: a 401 here makes well-behaved clients discard
+          # their tokens and sign the person out, so answer 503 and let
+          # them retry (RFC 6750 §3 covers only invalid credentials).
+          {:error, :unavailable} ->
+            unavailable(conn)
+
           {:error, reason} when required? ->
             challenge(conn, server, resource, reason, scope)
 
@@ -210,11 +218,32 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.BearerPlug do
 
     case Ash.get(server.user_resource(), sub, opts) do
       {:ok, user} -> {:ok, user}
-      _ -> {:error, :user_not_found}
+      {:error, error} -> {:error, classify_load_error(error)}
     end
   end
 
   defp load_user(_, _), do: {:error, :missing_subject}
+
+  # A missing or forbidden record is the token's problem; anything else
+  # (`Ash.Error.Invalid.Unavailable` from a data layer, an unknown error)
+  # is the store's.
+  defp classify_load_error(%Ash.Error.Forbidden{}), do: :user_not_found
+
+  defp classify_load_error(%{errors: errors}) when is_list(errors) and errors != [] do
+    if Enum.all?(errors, &match?(%Ash.Error.Query.NotFound{}, &1)),
+      do: :user_not_found,
+      else: :unavailable
+  end
+
+  defp classify_load_error(_), do: :unavailable
+
+  defp unavailable(conn) do
+    conn
+    |> put_resp_header("retry-after", "5")
+    |> put_resp_header("cache-control", "no-store")
+    |> send_resp(503, "")
+    |> halt()
+  end
 
   defp maybe_put_tenant_opt(opts, %{"tenant" => tenant}) when is_binary(tenant) and tenant != "",
     do: Keyword.put(opts, :tenant, tenant)

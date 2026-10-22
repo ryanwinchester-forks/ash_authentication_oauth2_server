@@ -9,7 +9,8 @@ defmodule Oauth2ServerTest.User do
   @moduledoc false
   use Ash.Resource,
     domain: Oauth2ServerTest.Domain,
-    data_layer: Ash.DataLayer.Ets
+    data_layer: Ash.DataLayer.Ets,
+    primary_read_warning?: false
 
   attributes do
     uuid_v7_primary_key :id
@@ -17,8 +18,43 @@ defmodule Oauth2ServerTest.User do
   end
 
   actions do
-    defaults [:read, :destroy]
+    defaults [:destroy]
     create :create, accept: [:email]
+
+    # `Oauth2ServerTest.Outage.simulate/1` makes every read fail the way a
+    # data layer does when its database is unreachable.
+    read :read do
+      primary? true
+      prepare Oauth2ServerTest.Outage
+    end
+  end
+end
+
+defmodule Oauth2ServerTest.Outage do
+  @moduledoc """
+  A preparation that fails reads with `Ash.Error.Invalid.Unavailable`, as
+  `ash_postgres` does when the database cannot be reached, while
+  `simulate/1` is on in the calling process.
+  """
+  use Ash.Resource.Preparation
+
+  @key :oauth2_server_test_outage
+
+  def simulate(on?), do: Process.put(@key, on?)
+
+  @impl true
+  def prepare(query, _opts, _context) do
+    if Process.get(@key, false) do
+      Ash.Query.add_error(
+        query,
+        Ash.Error.Invalid.Unavailable.exception(
+          resource: query.resource,
+          reason: "connection not available (simulated outage)"
+        )
+      )
+    else
+      query
+    end
   end
 end
 
@@ -131,7 +167,8 @@ defmodule Oauth2ServerTest.OAuthRefreshToken do
   use Ash.Resource,
     domain: Oauth2ServerTest.Domain,
     data_layer: Ash.DataLayer.Ets,
-    extensions: [AshAuthentication.Oauth2Server.RefreshTokenResource]
+    extensions: [AshAuthentication.Oauth2Server.RefreshTokenResource],
+    primary_read_warning?: false
 
   attributes do
     # Writable so the Token core can rotate-with-pre-allocated-id atomically.
@@ -150,7 +187,12 @@ defmodule Oauth2ServerTest.OAuthRefreshToken do
   end
 
   actions do
-    defaults [:read, :destroy]
+    defaults [:destroy]
+
+    read :read do
+      primary? true
+      prepare Oauth2ServerTest.Outage
+    end
 
     create :issue do
       accept [
@@ -198,7 +240,8 @@ defmodule Oauth2ServerTest.OAuthConsent do
   @moduledoc false
   use Ash.Resource,
     domain: Oauth2ServerTest.Domain,
-    data_layer: Ash.DataLayer.Ets
+    data_layer: Ash.DataLayer.Ets,
+    primary_read_warning?: false
 
   attributes do
     uuid_v7_primary_key :id
@@ -491,7 +534,8 @@ defmodule Oauth2ServerTest.TenantedUser do
   @moduledoc false
   use Ash.Resource,
     domain: Oauth2ServerTest.TenantedDomain,
-    data_layer: Ash.DataLayer.Ets
+    data_layer: Ash.DataLayer.Ets,
+    primary_read_warning?: false
 
   multitenancy do
     strategy :attribute
@@ -515,7 +559,8 @@ defmodule Oauth2ServerTest.TenantedOAuthClient do
   @moduledoc false
   use Ash.Resource,
     domain: Oauth2ServerTest.TenantedDomain,
-    data_layer: Ash.DataLayer.Ets
+    data_layer: Ash.DataLayer.Ets,
+    primary_read_warning?: false
 
   multitenancy do
     strategy :attribute
@@ -682,7 +727,8 @@ defmodule Oauth2ServerTest.TenantedOAuthConsent do
   @moduledoc false
   use Ash.Resource,
     domain: Oauth2ServerTest.TenantedDomain,
-    data_layer: Ash.DataLayer.Ets
+    data_layer: Ash.DataLayer.Ets,
+    primary_read_warning?: false
 
   multitenancy do
     strategy :attribute

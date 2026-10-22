@@ -429,7 +429,10 @@ defmodule AshAuthentication.Oauth2Server.Token do
   defp disambiguate_failure(server, hash, client_id, resource_urls, resource, opts) do
     case find_refresh(server, hash, opts) do
       {:ok, row} -> classify_row(row, client_id, resource_urls, resource) || :invalid_refresh
-      {:error, _} -> :invalid_refresh
+      # `:invalid_refresh` for a token that is not there; `:server_error`
+      # when the store could not answer, which must not read as
+      # `invalid_grant` (clients drop their refresh token on that).
+      {:error, reason} -> reason
     end
   end
 
@@ -450,6 +453,7 @@ defmodule AshAuthentication.Oauth2Server.Token do
         do: {:ok, Enum.join(requested, " ")},
         else: {:error, :invalid_scope}
     else
+      {:error, :server_error} -> {:error, :server_error}
       _ -> {:ok, nil}
     end
   end
@@ -528,9 +532,16 @@ defmodule AshAuthentication.Oauth2Server.Token do
     |> Ash.Query.filter(token_hash == ^hash)
     |> Ash.read_one(ash_opts(opts))
     |> case do
-      {:ok, nil} -> {:error, :invalid_refresh}
-      {:ok, row} -> {:ok, row}
-      _ -> {:error, :invalid_refresh}
+      {:ok, nil} ->
+        {:error, :invalid_refresh}
+
+      {:ok, row} ->
+        {:ok, row}
+
+      # The store did not answer; the token may well be valid.
+      {:error, error} ->
+        Logger.error("Oauth2Server: refresh-token lookup failed: " <> inspect(error))
+        {:error, :server_error}
     end
   end
 

@@ -46,6 +46,28 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.BearerPlugTest do
     end
   end
 
+  test "a valid token whose user cannot be loaded is 503, not a challenge", %{token: token} do
+    Oauth2ServerTest.Outage.simulate(true)
+    on_exit(fn -> Oauth2ServerTest.Outage.simulate(false) end)
+
+    conn = call("Bearer " <> token)
+    assert conn.halted
+    assert conn.status == 503
+    assert get_resp_header(conn, "retry-after") == ["5"]
+    assert get_resp_header(conn, "www-authenticate") == []
+  end
+
+  test "a token for a user that no longer exists is still invalid_token", %{token: _token} do
+    Ash.bulk_destroy!(User, :destroy, %{}, return_errors?: true)
+
+    {:ok, token, _} =
+      Jwt.mint(Server, sub: Ash.UUIDv7.generate(), client_id: "client", scope: "mcp")
+
+    conn = call("Bearer " <> token)
+    assert conn.status == 401
+    assert challenge(conn) =~ ~s|error="invalid_token"|
+  end
+
   test "a request without authentication gets a challenge without an error code" do
     for header <- [nil, "Basic dXNlcjpwYXNz"] do
       conn = call(header)
