@@ -172,6 +172,34 @@ defmodule Oauth2ServerTest.OAuthAuthorizationCode do
   end
 end
 
+defmodule Oauth2ServerTest.FailingInsert do
+  @moduledoc """
+  A change that fails a create the way a data layer does when its database
+  drops the statement, while `simulate/1` is on in the calling process.
+  """
+  use Ash.Resource.Change
+
+  @key :oauth2_server_test_failing_insert
+
+  @doc "`true` fails every create that carries this change, `false` none."
+  def simulate(on?), do: Process.put(@key, on?)
+
+  @impl true
+  def change(changeset, _opts, _context) do
+    if Process.get(@key, false) do
+      Ash.Changeset.add_error(
+        changeset,
+        Ash.Error.Invalid.Unavailable.exception(
+          resource: changeset.resource,
+          reason: "connection not available (simulated outage)"
+        )
+      )
+    else
+      changeset
+    end
+  end
+end
+
 defmodule Oauth2ServerTest.OAuthRefreshToken do
   @moduledoc false
   use Ash.Resource,
@@ -216,6 +244,8 @@ defmodule Oauth2ServerTest.OAuthRefreshToken do
         :resource_uri,
         :expires_at
       ]
+
+      change Oauth2ServerTest.FailingInsert
     end
 
     # `require_atomic? false` is necessary on the actions below only because

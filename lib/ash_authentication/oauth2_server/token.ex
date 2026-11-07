@@ -315,29 +315,98 @@ defmodule AshAuthentication.Oauth2Server.Token do
            requested_scope(server, hash, params, client_id, resource_urls, resource, opts) do
       new_refresh = {new_id, new_hash, new_raw}
 
-      case atomic_rotate(server, hash, client_id, resource, resource_urls, new_id, opts) do
-        {:ok, old_row} ->
-          complete_rotation(server, old_row, scope, presented_client_id, new_refresh, opts)
+      rotate_and_issue(server, opts, fn ->
+        case atomic_rotate(server, hash, client_id, resource, resource_urls, new_id, opts) do
+          {:ok, old_row} ->
+            case complete_rotation(server, old_row, scope, presented_client_id, new_refresh, opts) do
+              {:ok, response} ->
+                {:ok, response}
 
-        :no_match ->
-          case disambiguate_failure(server, hash, client_id, resource_urls, resource, opts) do
-            :reuse ->
-              revoke_chain_by_hash(server, hash, opts)
-              {:error, :reuse}
+              # The old row already says it was rotated to a successor that
+              # does not exist. Left like that, the client's next refresh
+              # with the token it still holds (a 500 tells it to keep it)
+              # reads as reuse and revokes the whole chain, so the rotate
+              # must not stand.
+              {:error, reason} ->
+                {:rollback, reason}
+            end
 
-            other ->
-              {:error, other}
+          :no_match ->
+            case disambiguate_failure(server, hash, client_id, resource_urls, resource, opts) do
+              :reuse ->
+                revoke_chain_by_hash(server, hash, opts)
+                {:error, :reuse}
+
+              other ->
+                {:error, other}
+            end
+
+          {:bulk_error, errors} ->
+            # The bulk update itself failed for a real reason (validation,
+            # constraint, DB connectivity, etc.). Log it for ops visibility,
+            # don't leak details to the caller, and skip the disambiguation
+            # read — we already know the operation didn't complete. The
+            # refresh token may still be valid, so this is not `invalid_grant`.
+            Logger.error("Oauth2Server: refresh-token bulk_update failed: " <> inspect(errors))
+
+            {:error, :server_error}
+        end
+      end)
+    end
+  end
+
+  # The rotate (the old row marked with its successor's id) and the insert
+  # of that successor stand or fall together. On a data layer that can
+  # transact they run in one transaction and `{:rollback, reason}` undoes
+  # the rotate. On one that cannot, nothing can undo it: the chain is dead
+  # and the client's next refresh will be refused, so that is logged as an
+  # error. On 2026-11-07 a starved connection pool failed the insert after
+  # the rotate had committed, and the phone's next refresh was treated as
+  # a replay.
+  defp rotate_and_issue(server, opts, fun) do
+    resource = server.refresh_token_resource()
+
+    if Ash.DataLayer.data_layer_can?(resource, :transact) do
+      resource
+      |> Ash.transaction(
+        fn ->
+          case fun.() do
+            {:rollback, reason} ->
+              Logger.error(
+                "Oauth2Server: refresh token rotated but its successor could not be stored; " <>
+                  "rolling the rotation back: " <> inspect(reason)
+              )
+
+              Ash.DataLayer.rollback(resource, :refresh_create_failed)
+
+            # Wrapped so no `{:error, _}` reaches `Ash.transaction`, which
+            # may be configured to roll back on one: a reuse's chain
+            # revocation must commit.
+            result ->
+              {:done, result}
           end
-
-        {:bulk_error, errors} ->
-          # The bulk update itself failed for a real reason (validation,
-          # constraint, DB connectivity, etc.). Log it for ops visibility,
-          # don't leak details to the caller, and skip the disambiguation
-          # read — we already know the operation didn't complete. The
-          # refresh token may still be valid, so this is not `invalid_grant`.
-          Logger.error("Oauth2Server: refresh-token bulk_update failed: " <> inspect(errors))
+        end,
+        Keyword.take(ash_opts(opts), [:tenant])
+      )
+      |> case do
+        {:ok, {:done, result}} -> result
+        # The rollback above, or the transaction itself could not run.
+        {:error, _error} -> {:error, :server_error}
+      end
+    else
+      case fun.() do
+        {:rollback, reason} ->
+          Logger.error(
+            "Oauth2Server: refresh token rotated but its successor could not be stored, and " <>
+              inspect(resource) <>
+              " cannot transact, so the rotation stands and the chain can no longer be refreshed: " <>
+              inspect(reason)
+          )
 
           {:error, :server_error}
+
+        result ->
+          result
       end
     end
   end
@@ -604,7 +673,9 @@ defmodule AshAuthentication.Oauth2Server.Token do
         :ok
 
       %Ash.BulkResult{status: status, errors: errors} ->
-        Logger.warning(
+        # Reuse was reported to the client, which drops its token; the chain
+        # the replay belonged to is still live, so someone should see this.
+        Logger.error(
           "Oauth2Server: chain revocation for chain_id=#{inspect(chain_id)} " <>
             "ended with status #{inspect(status)}: #{inspect(errors)}"
         )

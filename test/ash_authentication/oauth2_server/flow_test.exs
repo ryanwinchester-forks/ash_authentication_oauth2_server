@@ -808,6 +808,52 @@ defmodule AshAuthentication.Oauth2Server.FlowTest do
                Token.exchange_refresh_token(Server, refresh_params.(second.refresh_token))
     end
 
+    test "a rotation whose successor cannot be stored is a server error, never a leaked error",
+         %{user: user} do
+      {client, _} = register_client()
+      {verifier, challenge} = pkce_pair()
+
+      {:ok, validated} =
+        Authorize.validate_request(
+          Server,
+          authorize_params(client, challenge, "https://chat.example.com/cb")
+        )
+
+      code = Authorize.issue_code!(Server, user, validated)
+
+      {:ok, first} =
+        Token.exchange_authorization_code(Server, %{
+          "grant_type" => "authorization_code",
+          "code" => code.id,
+          "redirect_uri" => "https://chat.example.com/cb",
+          "code_verifier" => verifier,
+          "client_id" => client.id,
+          "resource" => Server.resource_url()
+        })
+
+      params = %{
+        "grant_type" => "refresh_token",
+        "refresh_token" => first.refresh_token,
+        "client_id" => client.id,
+        "resource" => Server.resource_url()
+      }
+
+      # The store dropped the insert of the successor after the old row was
+      # marked rotated. On a data layer that can transact the rotation is
+      # rolled back (covered against Postgres in a consuming app's suite);
+      # ETS cannot, so this is the fallback: the client hears `server_error`
+      # (keep the token, try again), and the dead chain is logged for ops.
+      Oauth2ServerTest.FailingInsert.simulate(true)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:error, :server_error} = Token.exchange_refresh_token(Server, params)
+        end)
+
+      Oauth2ServerTest.FailingInsert.simulate(false)
+      assert log =~ "cannot transact, so the rotation stands"
+    end
+
     test "a refresh during a store outage is a server error and leaves the token usable",
          %{user: user} do
       {client, _} = register_client()
